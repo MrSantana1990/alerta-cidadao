@@ -1,0 +1,3 @@
+web: gunicorn alerta_cidadao_backend.wsgi --log-file -
+release: python manage.py migrate
+

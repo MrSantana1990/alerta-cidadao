@@ -1,0 +1,263 @@
+from django.db import models
+from django.contrib.auth.models import User
+from django.utils import timezone
+import uuid
+
+class Contact(models.Model):
+    STATUS_CHOICES = [
+        ('active', 'Ativo'),
+        ('inactive', 'Inativo'),
+        ('optout', 'Opt-out'),
+    ]
+    
+    id = models.AutoField(primary_key=True)
+    name = models.CharField(max_length=255, blank=True, null=True)
+    phone = models.CharField(max_length=20, unique=True)  # E.164 format
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='active')
+    
+    # LGPD compliance fields
+    consent_given_at = models.DateTimeField(null=True, blank=True)
+    consent_ip = models.GenericIPAddressField(null=True, blank=True)
+    consent_text_hash = models.CharField(max_length=64, null=True, blank=True)
+    
+    class Meta:
+        db_table = 'contacts'
+        ordering = ['-created_at']
+    
+    def __str__(self):
+        return f"{self.name or 'Sem nome'} - {self.phone}"
+
+class Campaign(models.Model):
+    STATUS_CHOICES = [
+        ('draft', 'Rascunho'),
+        ('active', 'Ativa'),
+        ('paused', 'Pausada'),
+        ('completed', 'Concluída'),
+        ('cancelled', 'Cancelada'),
+    ]
+    
+    id = models.AutoField(primary_key=True)
+    title = models.CharField(max_length=255)
+    slug = models.SlugField(unique=True)
+    message = models.TextField()
+    description = models.TextField(blank=True, null=True)
+    start_at = models.DateTimeField(null=True, blank=True)
+    end_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(User, on_delete=models.CASCADE)
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='draft')
+    
+    # Referral campaign specific fields
+    is_referral_enabled = models.BooleanField(default=False)
+    referral_reward_text = models.TextField(blank=True, null=True)
+    
+    class Meta:
+        db_table = 'campaigns'
+        ordering = ['-created_at']
+    
+    def __str__(self):
+        return self.title
+
+class ReferralLink(models.Model):
+    id = models.AutoField(primary_key=True)
+    campaign = models.ForeignKey(Campaign, on_delete=models.CASCADE, related_name='referral_links')
+    contact = models.ForeignKey(Contact, on_delete=models.CASCADE, related_name='referral_links')
+    signed_token = models.CharField(max_length=255, unique=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    # Metrics
+    clicks_count = models.PositiveIntegerField(default=0)
+    referrals_count = models.PositiveIntegerField(default=0)
+    
+    class Meta:
+        db_table = 'referral_links'
+        unique_together = [['campaign', 'contact']]
+        ordering = ['-created_at']
+    
+    def __str__(self):
+        return f"Link {self.campaign.title} - {self.contact.phone}"
+    
+    @property
+    def referral_url(self):
+        from django.conf import settings
+        return f"{settings.SITE_URL}/r/{self.signed_token}"
+
+class Event(models.Model):
+    EVENT_TYPES = [
+        ('click', 'Click'),
+        ('optin', 'Opt-in'),
+        ('share', 'Share'),
+        ('optout', 'Opt-out'),
+    ]
+    
+    id = models.AutoField(primary_key=True)
+    campaign = models.ForeignKey(Campaign, on_delete=models.CASCADE, related_name='events')
+    contact = models.ForeignKey(Contact, on_delete=models.CASCADE, null=True, blank=True, related_name='events')
+    referrer_contact = models.ForeignKey(Contact, on_delete=models.CASCADE, null=True, blank=True, related_name='referred_events')
+    referral_link = models.ForeignKey(ReferralLink, on_delete=models.CASCADE, null=True, blank=True, related_name='events')
+    
+    type = models.CharField(max_length=10, choices=EVENT_TYPES)
+    timestamp = models.DateTimeField(auto_now_add=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.TextField(null=True, blank=True)
+    
+    # Additional data (JSON field for flexibility)
+    metadata = models.JSONField(default=dict, blank=True)
+    
+    class Meta:
+        db_table = 'events'
+        ordering = ['-timestamp']
+        indexes = [
+            models.Index(fields=['campaign', 'type', 'timestamp']),
+            models.Index(fields=['contact', 'type']),
+            models.Index(fields=['referrer_contact', 'type']),
+        ]
+    
+    def __str__(self):
+        return f"{self.type} - {self.campaign.title} - {self.timestamp}"
+
+class ReferralTree(models.Model):
+    """
+    Model to track the referral hierarchy and calculate metrics
+    """
+    id = models.AutoField(primary_key=True)
+    campaign = models.ForeignKey(Campaign, on_delete=models.CASCADE, related_name='referral_trees')
+    contact = models.ForeignKey(Contact, on_delete=models.CASCADE, related_name='referral_trees')
+    referrer_contact = models.ForeignKey(Contact, on_delete=models.CASCADE, null=True, blank=True, related_name='referred_trees')
+    
+    # Tree structure
+    level = models.PositiveIntegerField(default=0)  # 0 = root, 1 = first level, etc.
+    path = models.TextField()  # Materialized path for efficient queries
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        db_table = 'referral_trees'
+        unique_together = [['campaign', 'contact']]
+        indexes = [
+            models.Index(fields=['campaign', 'level']),
+            models.Index(fields=['referrer_contact']),
+        ]
+    
+    def __str__(self):
+        return f"Tree {self.campaign.title} - Level {self.level} - {self.contact.phone}"
+    
+    def get_children(self):
+        """Get direct children of this node"""
+        return ReferralTree.objects.filter(
+            campaign=self.campaign,
+            referrer_contact=self.contact
+        )
+    
+    def get_descendants(self):
+        """Get all descendants of this node"""
+        return ReferralTree.objects.filter(
+            campaign=self.campaign,
+            path__startswith=f"{self.path}/"
+        )
+
+class CampaignMetrics(models.Model):
+    """
+    Aggregated metrics for campaigns (updated periodically)
+    """
+    id = models.AutoField(primary_key=True)
+    campaign = models.OneToOneField(Campaign, on_delete=models.CASCADE, related_name='metrics')
+    
+    # Basic metrics
+    total_links_generated = models.PositiveIntegerField(default=0)
+    total_clicks = models.PositiveIntegerField(default=0)
+    unique_clicks = models.PositiveIntegerField(default=0)
+    total_optins = models.PositiveIntegerField(default=0)
+    total_shares = models.PositiveIntegerField(default=0)
+    
+    # Referral metrics
+    total_referrals = models.PositiveIntegerField(default=0)
+    max_tree_depth = models.PositiveIntegerField(default=0)
+    avg_tree_depth = models.FloatField(default=0.0)
+    
+    # Conversion metrics
+    click_to_optin_rate = models.FloatField(default=0.0)
+    referral_rate = models.FloatField(default=0.0)
+    
+    # Top performers
+    top_referrer_contact = models.ForeignKey(Contact, on_delete=models.SET_NULL, null=True, blank=True)
+    top_referrer_count = models.PositiveIntegerField(default=0)
+    
+    last_updated = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'campaign_metrics'
+    
+    def __str__(self):
+        return f"Metrics for {self.campaign.title}"
+    
+    def update_metrics(self):
+        """Update all metrics for this campaign"""
+        from django.db.models import Count, Avg, Max
+        
+        # Basic metrics
+        self.total_links_generated = self.campaign.referral_links.count()
+        
+        click_events = self.campaign.events.filter(type='click')
+        self.total_clicks = click_events.count()
+        self.unique_clicks = click_events.values('ip_address').distinct().count()
+        
+        self.total_optins = self.campaign.events.filter(type='optin').count()
+        self.total_shares = self.campaign.events.filter(type='share').count()
+        
+        # Referral metrics
+        trees = self.campaign.referral_trees.all()
+        self.total_referrals = trees.filter(level__gt=0).count()
+        
+        if trees.exists():
+            self.max_tree_depth = trees.aggregate(Max('level'))['level__max'] or 0
+            self.avg_tree_depth = trees.aggregate(Avg('level'))['level__avg'] or 0.0
+        
+        # Conversion rates
+        if self.total_clicks > 0:
+            self.click_to_optin_rate = (self.total_optins / self.total_clicks) * 100
+        
+        if self.total_optins > 0:
+            self.referral_rate = (self.total_referrals / self.total_optins) * 100
+        
+        # Top referrer
+        top_referrer = (
+            Contact.objects
+            .filter(referred_trees__campaign=self.campaign)
+            .annotate(referral_count=Count('referred_trees'))
+            .order_by('-referral_count')
+            .first()
+        )
+        
+        if top_referrer:
+            self.top_referrer_contact = top_referrer
+            self.top_referrer_count = top_referrer.referral_count
+        
+        self.save()
+
+class MessageTemplate(models.Model):
+    name = models.CharField(max_length=255, unique=True)
+    content = models.TextField()
+    category = models.CharField(max_length=50, choices=Campaign.STATUS_CHOICES) # Reusing Campaign STATUS_CHOICES for simplicity
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='message_templates')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.name
+
+class Report(models.Model):
+    campaign = models.OneToOneField(Campaign, on_delete=models.CASCADE, related_name='report')
+    total_sent = models.IntegerField(default=0)
+    total_delivered = models.IntegerField(default=0)
+    total_read = models.IntegerField(default=0)
+    total_pending = models.IntegerField(default=0)
+    total_optout = models.IntegerField(default=0)
+    generated_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"Report for {self.campaign.title}"
+
+

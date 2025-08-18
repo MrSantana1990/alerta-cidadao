@@ -2,7 +2,7 @@
 
 **Versão:** 1.0  
 **Data:** 15 de Agosto de 2025  
-**Autor:** Manus AI  
+**Autor:** Rodolfo Santana 
 **Projeto:** Sistema Alerta Cidadão - Prefeitura de Campinas  
 
 ## Visão Geral
